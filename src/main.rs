@@ -1,134 +1,135 @@
+//! Our system uses a single binary file to store an entire database
+//! This file in an unordered collection of fixed-size blocks of data called *pages*
+//! A page stores an entity of our database (table, index, etc.)
+//! This particular db file organization is commonly referred to as a heap file
+//! Each page has a unique identifier #pageid. Since an entire db fits into a single heap file, we can precisely retrieve any page
+//! by reading our file at an offset o = pageid * pagesize, assuming that all pages have the same size {pagesize}
+//! SQlite uses this approach and keeps a special (sub)page at the top of the heap file to keep track of the page
+//! organization as well as other metadata. See https://www.sqlite.org/fileformat.html
+
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Write},
+    io::{self},
     mem,
     os::unix::fs::FileExt,
 };
 
-#[derive(Debug)]
-struct Pager {
-    file: File,
-    page_size: u32,
-}
+type PageNumber = u32;
+const MAGIC_NUMBER: u32 = 0x50484442;
+const DEFAULT_PAGE_SIZE: u16 = 1024;
 
-#[derive(Debug)]
 struct DbHeader {
-    magic_number: u32,
-    page_size: u32,
-    total_pages: u32,
-    first_free_page: u32,
-    last_free_page: u32,
+    magic: u32,
+    page_size: u16,
+    page_count: u32,
 }
 impl DbHeader {
-    fn to_buffer(&self) -> [u8; mem::size_of::<Self>()] {
+    fn to_buf(&self) -> [u8; mem::size_of::<Self>()] {
         let mut buf = [0_u8; mem::size_of::<Self>()];
+        let mut offset = 0;
 
-        buf[..4].copy_from_slice(&self.magic_number.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.page_size.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.total_pages.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.first_free_page.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.last_free_page.to_le_bytes());
+        buf[offset..mem::size_of_val(&self.magic) + offset]
+            .copy_from_slice(&self.magic.to_le_bytes());
+        offset += mem::size_of_val(&self.magic);
+
+        buf[offset..mem::size_of_val(&self.page_size) + offset]
+            .copy_from_slice(&self.page_size.to_le_bytes());
+        offset += mem::size_of_val(&self.page_size);
+
+        buf[offset..mem::size_of_val(&self.page_count) + offset]
+            .copy_from_slice(&self.page_count.to_le_bytes());
 
         buf
     }
 
-    fn from_buffer(buf: &[u8; mem::size_of::<Self>()]) -> Self {
+    fn from(buf: &[u8]) -> Self {
+        let mut offset = 0;
+
+        let magic = u32::from_le_bytes(
+            buf[offset..mem::size_of::<u32>() + offset]
+                .try_into()
+                .expect("Invalid size"),
+        );
+        offset += mem::size_of::<u32>();
+
+        let page_size = u16::from_le_bytes(
+            buf[offset..mem::size_of::<u16>() + offset]
+                .try_into()
+                .expect("Invalid size"),
+        );
+        offset += mem::size_of::<u16>();
+
+        let page_count = u32::from_le_bytes(
+            buf[offset..mem::size_of::<u32>() + offset]
+                .try_into()
+                .expect("Invalid size"),
+        );
+
         Self {
-            magic_number: u32::from_le_bytes(buf[..4].try_into().expect("Incorrect size")),
-            page_size: u32::from_le_bytes(buf[4..8].try_into().expect("Incorrect size")),
-            total_pages: u32::from_le_bytes(buf[8..12].try_into().expect("Incorrect size")),
-            first_free_page: u32::from_le_bytes(buf[12..16].try_into().expect("Incorrect size")),
-            last_free_page: u32::from_le_bytes(buf[16..20].try_into().expect("Incorrect size")),
+            magic,
+            page_size,
+            page_count,
+        }
+    }
+
+    fn alloc(page_size: u16) -> Self {
+        Self {
+            magic: MAGIC_NUMBER,
+            page_size,
+            page_count: 0,
         }
     }
 }
 
-struct Page {
-    content: String,
+// This struct implements an in-memory cache representation of a database heap file. It reads and writes pages one at a time
+// from and to disk.
+#[derive(Debug)]
+struct Pager {
+    file: File,
+    page_size: u16,
 }
-impl Page {
-    fn to_buffer(&self) -> &[u8] {
-        self.content.as_bytes()
-    }
-}
-
-const DEFAULT_PAGE_SIZE: u32 = 512;
-const MAGIC: u32 = 0x50484442;
-
 impl Pager {
     fn init(&mut self) -> io::Result<()> {
-        let mut header_buf = [0_u8; mem::size_of::<DbHeader>()];
-        self.read(0, &mut header_buf)?;
+        let mut header = [0_u8; mem::size_of::<DbHeader>()];
+        self.read(0, &mut header)?;
+        let header = DbHeader::from(&header);
 
-        let header = DbHeader::from_buffer(&header_buf);
-
-        if header.magic_number == MAGIC {
+        if header.magic == MAGIC_NUMBER {
             self.page_size = header.page_size;
             return Ok(());
         }
 
-        let header = DbHeader {
-            magic_number: MAGIC,
-            page_size: self.page_size,
-            total_pages: 1,
-            first_free_page: 0,
-            last_free_page: 0,
-        };
-
-        let read: usize = self.file.write(&header.to_buffer())?;
-
+        self.write(0, &DbHeader::alloc(self.page_size).to_buf())?;
         Ok(())
     }
 
-    fn read(&mut self, page_number: u32, buf: &mut [u8]) -> io::Result<usize> {
-        if page_number == 0 {
-            return self.file.read_at(buf, 0);
-        }
-
-        let offset = mem::size_of::<DbHeader>() as u32 + self.page_size * (page_number - 1);
-        self.file.read_at(buf, offset as u64)
+    fn read(&self, page_no: PageNumber, buf: &mut [u8]) -> io::Result<usize> {
+        self.file
+            .read_at(buf, (page_no * self.page_size as u32).into())
     }
 
-    fn write(&mut self, page_number: u32, buf: &[u8]) -> io::Result<usize> {
-        let offset = mem::size_of::<DbHeader>() as u32 + self.page_size * (page_number - 1);
-        self.file.write_at(buf, offset as u64)
+    fn write(&self, page_no: PageNumber, buf: &[u8]) -> io::Result<usize> {
+        self.file
+            .write_at(buf, (page_no * self.page_size as u32).into())
     }
 }
 
-#[derive(Debug)]
-struct Database {
-    name: String,
-    pager: Pager,
-}
+fn main() -> io::Result<()> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .truncate(false)
+        .write(true)
+        .open("mydb.phdb")?;
 
-impl Database {
-    fn init(name: &str) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(name.to_owned() + ".phdb")?;
+    let mut pager = Pager {
+        file,
+        page_size: DEFAULT_PAGE_SIZE,
+    };
 
-        let mut pager = Pager {
-            file,
-            page_size: DEFAULT_PAGE_SIZE,
-        };
+    pager.init()?;
 
-        pager.init()?;
+    println!("{:?}", pager);
 
-        Ok(Self {
-            name: name.to_string(),
-            pager,
-        })
-    }
-}
-
-fn main() {
-    let mut users_db = Database::init("products").unwrap();
-
-    users_db
-        .pager
-        .write(2, b"Hello Page 2")
-        .expect("Something went wrong");
+    Ok(())
 }
